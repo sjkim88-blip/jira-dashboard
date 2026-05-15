@@ -1,407 +1,716 @@
 """
-Jira Cloud — 주간 업무 현황 대시보드
+사업기획팀 주간 현황 대시보드
+- Jira에서 볼 수 없는 것만 보여준다
+- 감시툴 X → 팀 함께 보는 현황판
 """
+
 from __future__ import annotations
+
+import html
 import os
 from datetime import date, datetime, timedelta
+from typing import Any
+
 import pandas as pd
 import requests
 import streamlit as st
 from dotenv import load_dotenv
 
+# -----------------------------------------------------------------------------
+# 1. 환경설정
+# -----------------------------------------------------------------------------
 load_dotenv()
 
 JIRA_SERVER = (os.getenv("JIRA_SERVER") or "").rstrip("/")
-JIRA_EMAIL  = (os.getenv("JIRA_EMAIL")  or "").strip()
-JIRA_TOKEN  = (os.getenv("JIRA_API_TOKEN") or "")
-JIRA_KEY    = (os.getenv("JIRA_PROJECT_KEY") or "").strip()
+JIRA_EMAIL = (os.getenv("JIRA_EMAIL") or "").strip()
+JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN") or ""
+JIRA_PROJECT_KEY = (os.getenv("JIRA_PROJECT_KEY") or "").strip()
 
-_DONE     = frozenset({"완료", "Done", "DONE", "Closed", "closed", "Resolved", "resolved"})
-_KOR_DAYS = ["월요일", "화요일", "수요일", "목요일", "금요일"]
+_DONE_NAMES = frozenset({"완료", "Done", "DONE", "Closed", "closed", "Resolved", "resolved", "drop", "Drop", "DROP"})
+_HOLD_NAMES = frozenset({"홀딩", "Hold", "HOLD", "On Hold", "on hold", "보류"})
 
-# ─── helpers ──────────────────────────────────────────────────────────────
 
-def week_bounds(ref: date) -> tuple[date, date]:
-    mon = ref - timedelta(days=ref.weekday())
-    return mon, mon + timedelta(days=4)
+# -----------------------------------------------------------------------------
+# 2. 유틸
+# -----------------------------------------------------------------------------
+def require_config() -> bool:
+    missing = []
+    if not JIRA_SERVER: missing.append("JIRA_SERVER")
+    if not JIRA_EMAIL: missing.append("JIRA_EMAIL")
+    if not JIRA_API_TOKEN: missing.append("JIRA_API_TOKEN")
+    if not JIRA_PROJECT_KEY: missing.append("JIRA_PROJECT_KEY")
+    if missing:
+        st.error(f".env 파일에 다음 정보가 없습니다: {', '.join(missing)}")
+        return False
+    return True
 
-def parse_d(s) -> date | None:
-    if not s:
+
+def h(value: Any) -> str:
+    return html.escape(str(value or ""))
+
+
+def parse_jira_datetime(value: str | None) -> datetime | None:
+    if not value:
         return None
     try:
-        return datetime.fromisoformat(str(s)[:19]).date()
-    except Exception:
-        return None
+        return datetime.strptime(value[:19], "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+        except ValueError:
+            return None
 
-# ─── Jira API ─────────────────────────────────────────────────────────────
 
+def fmt_date(value: Any) -> str:
+    if value is None: return "—"
+    if isinstance(value, datetime): return value.strftime("%Y-%m-%d")
+    if isinstance(value, date): return value.strftime("%Y-%m-%d")
+    return str(value)[:10] if value else "—"
+
+
+def fmt_datetime(value: datetime | None) -> str:
+    return value.strftime("%Y-%m-%d %H:%M") if value else "—"
+
+
+def get_week_range(offset_weeks: int = 0) -> tuple[date, date]:
+    today = date.today()
+    monday = today - timedelta(days=today.weekday()) + timedelta(weeks=offset_weeks)
+    friday = monday + timedelta(days=4)
+    return monday, friday
+
+
+def is_done(status: str) -> bool:
+    return status in _DONE_NAMES
+
+def is_hold(status: str) -> bool:
+    return status in _HOLD_NAMES
+
+def days_stale(updated_date: date | None) -> int:
+    if not updated_date:
+        return 0
+    return max((date.today() - updated_date).days, 0)
+
+
+# -----------------------------------------------------------------------------
+# 3. Jira API
+# -----------------------------------------------------------------------------
 @st.cache_data(ttl=120, show_spinner=False)
-def fetch(server: str, email: str, token: str, key: str, extra_jql: str = "") -> list:
-    jql = f'project = "{key}"'
-    if extra_jql.strip():
-        jql = f"({jql}) AND ({extra_jql.strip()})"
+def fetch_issues(server: str, email: str, token: str, project_key: str, jql_extra: str = "") -> list[dict]:
+    jql = f'project = "{project_key}"'
+    if jql_extra.strip():
+        jql = f"({jql}) AND ({jql_extra.strip()})"
     jql += " ORDER BY updated DESC"
-    resp = requests.get(
-        f"{server}/rest/api/3/search/jql",
-        auth=(email, token),
-        params={
-            "jql": jql,
-            "maxResults": 500,
-            "fields": ["summary", "status", "assignee", "updated", "created"],
-        },
-        timeout=30,
+
+    auth = (email, token)
+    params = {
+        "jql": jql,
+        "maxResults": 200,
+        "fields": ["summary", "status", "assignee", "updated", "created", "priority", "duedate", "labels"],
+    }
+    url = f"{server}/rest/api/3/search/jql"
+    r = requests.get(url, auth=auth, params=params, timeout=30)
+    r.raise_for_status()
+    return r.json().get("issues", [])
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_issue_detail(server: str, email: str, token: str, issue_key: str) -> dict:
+    auth = (email, token)
+    url = f"{server}/rest/api/3/issue/{issue_key}"
+    r = requests.get(url, auth=auth, params={"fields": "summary,status,assignee,comment,priority,duedate"}, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_transitions(server: str, email: str, token: str, issue_key: str) -> list[dict]:
+    auth = (email, token)
+    url = f"{server}/rest/api/3/issue/{issue_key}/transitions"
+    r = requests.get(url, auth=auth, timeout=30)
+    r.raise_for_status()
+    return r.json().get("transitions", [])
+
+
+def add_comment(server: str, email: str, token: str, issue_key: str, text: str) -> bool:
+    auth = (email, token)
+    url = f"{server}/rest/api/3/issue/{issue_key}/comment"
+    payload = {
+        "body": {
+            "type": "doc", "version": 1,
+            "content": [{"type": "paragraph", "content": [{"type": "text", "text": text}]}]
+        }
+    }
+    r = requests.post(url, auth=auth, json=payload, timeout=30)
+    return r.status_code in (200, 201)
+
+
+def change_status(server: str, email: str, token: str, issue_key: str, transition_id: str) -> bool:
+    auth = (email, token)
+    url = f"{server}/rest/api/3/issue/{issue_key}/transitions"
+    r = requests.post(url, auth=auth, json={"transition": {"id": transition_id}}, timeout=30)
+    return r.status_code in (200, 204)
+
+
+# -----------------------------------------------------------------------------
+# 4. 데이터 가공
+# -----------------------------------------------------------------------------
+def flatten(server: str, raw: dict) -> dict:
+    fields = raw.get("fields") or {}
+    status = (fields.get("status") or {}).get("name") or ""
+    assignee = fields.get("assignee")
+    created_dt = parse_jira_datetime(fields.get("created"))
+    updated_dt = parse_jira_datetime(fields.get("updated"))
+
+    return {
+        "키": raw.get("key") or "",
+        "요약": fields.get("summary") or "",
+        "상태": status,
+        "담당자": (assignee or {}).get("displayName") if assignee else "미지정",
+        "작성일_date": created_dt.date() if created_dt else None,
+        "변경일_date": updated_dt.date() if updated_dt else None,
+        "변경일": fmt_date(updated_dt),
+        "만기일": fmt_date(fields.get("duedate")),
+        "링크": f"{server}/browse/{raw.get('key')}",
+        "라벨": fields.get("labels") or [],
+    }
+
+
+def build_data(rows: list[dict], week_start: date, week_end: date) -> dict:
+    today = date.today()
+
+    def in_week(d): return d is not None and week_start <= d <= week_end
+
+    new_this_week = [r for r in rows if in_week(r.get("작성일_date"))]
+    done_this_week = [r for r in rows if in_week(r.get("변경일_date")) and is_done(r.get("상태", ""))]
+
+    # Drop 제외한 진짜 정체
+    active = [r for r in rows if not is_done(r.get("상태", "")) and not is_hold(r.get("상태", ""))]
+    need_attention = sorted(
+        [r for r in active if days_stale(r.get("변경일_date")) >= 7],
+        key=lambda r: days_stale(r.get("변경일_date")),
+        reverse=True
     )
-    resp.raise_for_status()
-    return resp.json().get("issues", [])
 
-def to_rows(server: str, raw_list: list) -> list[dict]:
-    out = []
-    for raw in raw_list:
-        f   = raw.get("fields") or {}
-        stn = (f.get("status") or {}).get("name") or ""
-        asn = f.get("assignee")
-        out.append(dict(
-            key      = raw["key"],
-            summary  = f.get("summary", ""),
-            status   = stn,
-            assignee = asn["displayName"] if asn else "미지정",
-            created  = parse_d(f.get("created")),
-            updated  = parse_d(f.get("updated")),
-            link     = f"{server}/browse/{raw['key']}",
-            done     = stn in _DONE,
-        ))
-    return out
+    # 요일별 신규
+    by_day = {}
+    for i in range(5):
+        d = week_start + timedelta(days=i)
+        by_day[d] = [r for r in rows if r.get("작성일_date") == d]
 
-# ─── CSS ──────────────────────────────────────────────────────────────────
+    return {
+        "new_this_week": new_this_week,
+        "done_this_week": done_this_week,
+        "need_attention": need_attention,
+        "by_day": by_day,
+        "total_active": len(active),
+    }
 
+
+# -----------------------------------------------------------------------------
+# 5. CSS
+# -----------------------------------------------------------------------------
 def inject_css():
     st.markdown("""
-<style>
-/* global */
-[data-testid="stAppViewContainer"] { background: #f0f2f6; }
-[data-testid="stHeader"]           { display: none; }
-.block-container { padding-top: 1.4rem !important; padding-bottom: 2rem !important; }
-div[data-testid="column"] { padding: 0 6px; }
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700;800&display=swap');
 
-/* header */
-.hdr-title {
-    font-size: 1.35rem; font-weight: 800; color: #1a1a2e;
-    display: flex; align-items: center; gap: 10px;
-}
-.hdr-badge {
-    font-size: .72rem; background: #e3f2fd; color: #1565c0;
-    border-radius: 5px; padding: 2px 9px; font-weight: 600;
-}
-.hdr-meta { font-size: .78rem; color: #888; text-align: right; margin-top: 6px; }
+    html, body, [class*="css"] {
+        font-family: 'Noto Sans KR', system-ui, sans-serif;
+    }
+    .stApp { background: #F0F4F8; }
+    .block-container { padding-top: 1.5rem; padding-bottom: 3rem; max-width: 1600px; }
 
-/* filter bar */
-.filter-bar {
-    background: #fff; border-radius: 10px; padding: 10px 16px;
-    box-shadow: 0 1px 4px rgba(0,0,0,.07); margin-bottom: 18px;
-    display: flex; align-items: center; gap: 12px;
-}
+    .dash-header {
+        background: white;
+        border-radius: 16px;
+        padding: 20px 24px;
+        margin-bottom: 20px;
+        border: 1px solid #E2E8F0;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+    }
+    .dash-title { font-size: 22px; font-weight: 800; color: #0F172A; letter-spacing: -0.03em; }
+    .dash-sub { font-size: 13px; color: #64748B; margin-top: 3px; }
+    .dash-week { font-size: 13px; color: #94A3B8; }
 
-/* KPI */
-.kpi-card {
-    background: #fff; border-radius: 12px; padding: 18px 20px;
-    box-shadow: 0 2px 8px rgba(0,0,0,.07);
-}
-.kpi-icon  { font-size: 1.7rem; margin-bottom: 4px; }
-.kpi-label { font-size: .72rem; color: #888; font-weight: 700;
-             text-transform: uppercase; letter-spacing: .04em; }
-.kpi-value { font-size: 2.3rem; font-weight: 900; color: #1a1a2e; line-height: 1.1; }
-.kpi-delta { font-size: .78rem; margin-top: 4px; }
+    .summary-bar {
+        display: flex;
+        gap: 12px;
+        margin-bottom: 20px;
+    }
+    .summary-chip {
+        background: white;
+        border: 1px solid #E2E8F0;
+        border-radius: 12px;
+        padding: 14px 20px;
+        flex: 1;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+    }
+    .summary-chip-label { font-size: 12px; color: #64748B; font-weight: 600; margin-bottom: 4px; }
+    .summary-chip-value { font-size: 28px; font-weight: 800; color: #0F172A; letter-spacing: -0.04em; }
+    .summary-chip-diff { font-size: 12px; margin-top: 4px; }
+    .diff-up { color: #059669; }
+    .diff-down { color: #DC2626; }
+    .diff-same { color: #94A3B8; }
 
-/* section title */
-.sec-title {
-    font-size: .95rem; font-weight: 800; color: #1a1a2e;
-    margin: 0 0 10px; border-left: 3px solid #1976d2; padding-left: 8px;
-}
+    .section-wrap {
+        background: white;
+        border-radius: 16px;
+        border: 1px solid #E2E8F0;
+        padding: 20px;
+        margin-bottom: 16px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+    }
+    .section-label {
+        font-size: 15px;
+        font-weight: 800;
+        color: #0F172A;
+        margin-bottom: 14px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+    .section-count {
+        background: #F1F5F9;
+        border-radius: 999px;
+        font-size: 12px;
+        font-weight: 700;
+        color: #475569;
+        padding: 2px 8px;
+    }
 
-/* weekly flow */
-.day-col {
-    background: #fff; border-radius: 10px; padding: 12px 10px;
-    box-shadow: 0 1px 4px rgba(0,0,0,.06); min-height: 220px;
-}
-.day-header { font-weight: 800; font-size: .85rem; color: #1a1a2e; }
-.day-date   { font-size: .75rem; color: #888; margin-bottom: 6px; }
-.day-badges { display: flex; gap: 6px; margin-bottom: 10px; }
-.badge-new  {
-    font-size: .68rem; background: #e3f2fd; color: #1565c0;
-    border-radius: 4px; padding: 1px 7px; font-weight: 600;
-}
-.badge-chg  {
-    font-size: .68rem; background: #e8f5e9; color: #2e7d32;
-    border-radius: 4px; padding: 1px 7px; font-weight: 600;
-}
+    .attention-item {
+        display: flex;
+        align-items: flex-start;
+        gap: 12px;
+        padding: 14px;
+        border-radius: 12px;
+        border: 1px solid #E2E8F0;
+        margin-bottom: 10px;
+        background: #FAFAFA;
+        transition: border-color 0.15s;
+    }
+    .attention-item:hover { border-color: #94A3B8; background: white; }
+    .attention-days {
+        min-width: 52px;
+        text-align: center;
+        border-radius: 10px;
+        padding: 6px 4px;
+        font-size: 13px;
+        font-weight: 800;
+    }
+    .days-red { background: #FEE2E2; color: #DC2626; }
+    .days-orange { background: #FFEDD5; color: #EA580C; }
+    .attention-key { font-size: 12px; font-weight: 700; color: #2563EB; margin-bottom: 3px; }
+    .attention-summary { font-size: 13px; color: #1E293B; line-height: 1.4; margin-bottom: 6px; }
+    .attention-meta { font-size: 12px; color: #94A3B8; display: flex; gap: 10px; flex-wrap: wrap; }
+    .status-badge {
+        display: inline-block;
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 700;
+        padding: 2px 8px;
+        background: #EFF6FF;
+        color: #2563EB;
+        border: 1px solid #BFDBFE;
+    }
 
-/* ticket card */
-.tcard {
-    border-left: 3px solid #ccc; background: #fafafa;
-    border-radius: 0 6px 6px 0; padding: 7px 9px;
-    margin-bottom: 7px; font-size: .76rem; line-height: 1.4;
-}
-.tcard.is-new     { border-color: #1976d2; }
-.tcard.is-changed { border-color: #388e3c; }
-.tcard-key { font-weight: 700; color: #1a1a2e; font-size: .77rem; }
-.tcard-sum { color: #555; margin: 2px 0;
-             white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.tcard-foot { display: flex; justify-content: space-between; align-items: center; margin-top: 3px; }
-.st-badge   {
-    font-size: .62rem; background: #ede7f6; color: #512da8;
-    border-radius: 4px; padding: 1px 5px;
-}
-.st-badge.new-tag {
-    background: #e3f2fd; color: #1565c0;
-}
-.assignee   { font-size: .65rem; color: #999; }
-.more-link  { font-size: .73rem; color: #1976d2; margin-top: 5px; cursor: pointer; }
+    .new-item {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 10px 12px;
+        border-radius: 10px;
+        border: 1px solid #E2E8F0;
+        margin-bottom: 8px;
+        background: white;
+    }
+    .new-dot {
+        width: 8px; height: 8px;
+        border-radius: 50%;
+        background: #2563EB;
+        flex-shrink: 0;
+    }
+    .new-key { font-size: 12px; font-weight: 700; color: #2563EB; white-space: nowrap; }
+    .new-summary { font-size: 13px; color: #334155; flex: 1; }
+    .new-assignee { font-size: 12px; color: #94A3B8; white-space: nowrap; }
 
-/* alert panel */
-.alert-panel {
-    background: #fff; border-radius: 10px; padding: 14px 14px;
-    box-shadow: 0 1px 4px rgba(0,0,0,.06);
-}
-.alert-group-title { font-size: .83rem; font-weight: 800; margin: 12px 0 8px; }
-.alert-card {
-    border-radius: 7px; padding: 9px 11px; margin-bottom: 7px;
-    font-size: .77rem; line-height: 1.45;
-    display: flex; justify-content: space-between; align-items: flex-start; gap: 8px;
-}
-.alert-card.red    { background: #fff5f5; border: 1px solid #ffcdd2; }
-.alert-card.orange { background: #fff8f0; border: 1px solid #ffe0b2; }
-.alert-key  { font-weight: 700; color: #1a1a2e; }
-.alert-sub  { color: #777; font-size: .7rem; margin-top: 2px; }
-.alert-days-red    { color: #c62828; font-weight: 800; font-size: .8rem;
-                     text-align: right; white-space: nowrap; }
-.alert-days-orange { color: #e65100; font-weight: 800; font-size: .8rem;
-                     text-align: right; white-space: nowrap; }
+    .day-grid {
+        display: grid;
+        grid-template-columns: repeat(5, 1fr);
+        gap: 10px;
+        margin-top: 4px;
+    }
+    .day-col {
+        border: 1px solid #E2E8F0;
+        border-radius: 12px;
+        padding: 12px;
+        background: #F8FAFC;
+        min-height: 80px;
+    }
+    .day-col-head {
+        font-size: 13px;
+        font-weight: 800;
+        color: #0F172A;
+        margin-bottom: 4px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
+    .day-col-date { font-size: 11px; color: #94A3B8; }
+    .day-count { font-size: 20px; font-weight: 800; color: #2563EB; margin: 6px 0; }
+    .day-empty { font-size: 12px; color: #CBD5E1; }
+    .day-items { margin-top: 8px; }
+    .day-ticket-key { font-size: 11px; font-weight: 700; color: #2563EB; }
+    .day-ticket-summary { font-size: 11px; color: #475569; line-height: 1.3; margin-bottom: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
-/* full ticket table */
-.table-wrap {
-    background: #fff; border-radius: 10px; padding: 16px;
-    box-shadow: 0 1px 4px rgba(0,0,0,.06); margin-top: 18px;
-}
-</style>
-""", unsafe_allow_html=True)
+    .empty-msg {
+        text-align: center;
+        color: #CBD5E1;
+        font-size: 13px;
+        padding: 20px;
+        border: 1px dashed #E2E8F0;
+        border-radius: 10px;
+    }
 
-# ─── render helpers ───────────────────────────────────────────────────────
+    .comment-box {
+        background: #F8FAFC;
+        border: 1px solid #E2E8F0;
+        border-radius: 10px;
+        padding: 12px;
+        margin-bottom: 8px;
+    }
+    .comment-author { font-size: 13px; font-weight: 700; color: #0F172A; }
+    .comment-date { font-size: 11px; color: #94A3B8; margin-left: 6px; }
+    .comment-text { font-size: 13px; color: #334155; margin-top: 5px; line-height: 1.5; }
+    </style>
+    """, unsafe_allow_html=True)
 
-def render_kpi(icon: str, label: str, value: int, delta: int, higher_is_bad: bool = False):
-    if delta > 0:
-        sign = "▲"
-        color = "#f44336" if higher_is_bad else "#4caf50"
-    elif delta < 0:
-        sign = "▼"
-        color = "#4caf50" if higher_is_bad else "#f44336"
-    else:
-        sign, color = "—", "#aaa"
 
-    delta_html = (
-        f'<div class="kpi-delta" style="color:{color}">'
-        f'지난 주 대비 {sign} {abs(delta)}</div>'
-        if delta != 0 else
-        '<div class="kpi-delta" style="color:#aaa">지난 주 대비 동일</div>'
+# -----------------------------------------------------------------------------
+# 6. 티켓 상세 사이드바
+# -----------------------------------------------------------------------------
+def render_sidebar(issue_key: str):
+    with st.sidebar:
+        st.markdown(f"### 🎫 {issue_key}")
+        st.markdown("---")
+
+        try:
+            detail = fetch_issue_detail(JIRA_SERVER, JIRA_EMAIL, JIRA_API_TOKEN, issue_key)
+            fields = detail.get("fields") or {}
+            summary = fields.get("summary") or ""
+            status = (fields.get("status") or {}).get("name") or ""
+            assignee_info = fields.get("assignee")
+            assignee = (assignee_info or {}).get("displayName") if assignee_info else "미지정"
+            due_date = fmt_date(fields.get("duedate"))
+
+            st.markdown(f"**{summary}**")
+            st.markdown(f"📌 상태: `{status}`")
+            st.markdown(f"👤 담당자: {assignee}")
+            st.markdown(f"📅 만기일: {due_date}")
+            st.markdown(f"🔗 [Jira에서 열기]({JIRA_SERVER}/browse/{issue_key})")
+            st.markdown("---")
+
+            # 상태 변경
+            st.markdown("**🔄 상태 변경**")
+            transitions = fetch_transitions(JIRA_SERVER, JIRA_EMAIL, JIRA_API_TOKEN, issue_key)
+            if transitions:
+                t_map = {t["name"]: t["id"] for t in transitions}
+                selected = st.selectbox("변경할 상태", list(t_map.keys()), key=f"t_{issue_key}")
+                if st.button("적용", key=f"apply_{issue_key}", use_container_width=True):
+                    if change_status(JIRA_SERVER, JIRA_EMAIL, JIRA_API_TOKEN, issue_key, t_map[selected]):
+                        st.success(f"✅ '{selected}' 으로 변경됐어요!")
+                        st.cache_data.clear()
+                        st.rerun()
+                    else:
+                        st.error("변경 실패. 권한을 확인해주세요.")
+            else:
+                st.info("가능한 상태 전환 없음")
+
+            st.markdown("---")
+
+            # 댓글
+            st.markdown("**💬 댓글 달기**")
+            comment_text = st.text_area("내용", placeholder="댓글을 입력하세요...", key=f"c_{issue_key}", height=80, label_visibility="collapsed")
+            if st.button("등록", key=f"post_{issue_key}", use_container_width=True):
+                if comment_text.strip():
+                    if add_comment(JIRA_SERVER, JIRA_EMAIL, JIRA_API_TOKEN, issue_key, comment_text.strip()):
+                        st.success("✅ 댓글이 등록됐어요!")
+                        st.cache_data.clear()
+                        st.rerun()
+                    else:
+                        st.error("등록 실패")
+                else:
+                    st.warning("내용을 입력해주세요.")
+
+            st.markdown("---")
+
+            # 댓글 목록
+            st.markdown("**📋 댓글 목록**")
+            comments = (fields.get("comment") or {}).get("comments") or []
+            if comments:
+                for c in reversed(comments[-8:]):
+                    author = (c.get("author") or {}).get("displayName") or "알 수 없음"
+                    created = parse_jira_datetime(c.get("created"))
+                    body_text = ""
+                    for block in ((c.get("body") or {}).get("content") or []):
+                        for inline in (block.get("content") or []):
+                            if inline.get("type") == "text":
+                                body_text += inline.get("text", "")
+                    st.markdown(
+                        f'<div class="comment-box"><span class="comment-author">{h(author)}</span>'
+                        f'<span class="comment-date">{fmt_datetime(created)}</span>'
+                        f'<div class="comment-text">{h(body_text)}</div></div>',
+                        unsafe_allow_html=True
+                    )
+            else:
+                st.markdown('<div class="empty-msg">아직 댓글이 없습니다.</div>', unsafe_allow_html=True)
+
+        except Exception as e:
+            st.error(f"불러오기 실패: {e}")
+
+        st.markdown("---")
+        if st.button("✖ 닫기", use_container_width=True):
+            st.session_state.selected_ticket = None
+            st.rerun()
+
+
+# -----------------------------------------------------------------------------
+# 7. 렌더링
+# -----------------------------------------------------------------------------
+def render_header(week_start: date, week_end: date, last_updated: datetime):
+    st.markdown(
+        f"""
+        <div class="dash-header">
+            <div>
+                <div class="dash-title">🗂 사업기획팀 주간 현황</div>
+                <div class="dash-sub">Jira에서 한눈에 보기 어려운 것들을 모았어요</div>
+            </div>
+            <div class="dash-week">
+                {week_start:%Y.%m.%d}(월) ~ {week_end:%Y.%m.%d}(금)<br>
+                <span style="font-size:11px;">업데이트 {fmt_datetime(last_updated)}</span>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True
     )
-    st.markdown(f"""
-<div class="kpi-card">
-  <div class="kpi-icon">{icon}</div>
-  <div class="kpi-label">{label}</div>
-  <div class="kpi-value">{value:,}</div>
-  {delta_html}
-</div>""", unsafe_allow_html=True)
 
 
-def ticket_card_html(r: dict, card_type: str = "is-new") -> str:
-    key  = r["key"]
-    sm   = (r["summary"] or "")[:32]
-    tag  = '<span class="st-badge new-tag">신규</span>' if card_type == "is-new" \
-           else f'<span class="st-badge">{r["status"]}</span>'
-    return f"""
-<div class="tcard {card_type}">
-  <div class="tcard-key">{key}</div>
-  <div class="tcard-sum">{sm}</div>
-  <div class="tcard-foot">{tag}<span class="assignee">{r['assignee']}</span></div>
-</div>"""
+def render_summary_bar(this_week: dict, last_week: dict):
+    new_this = len(this_week["new_this_week"])
+    new_last = len(last_week["new_this_week"])
+    done_this = len(this_week["done_this_week"])
+    done_last = len(last_week["done_this_week"])
+    attention_this = len(this_week["need_attention"])
+    attention_last = len(last_week["need_attention"])
+
+    def diff_html(a, b, reverse=False):
+        diff = a - b
+        if diff == 0:
+            return '<span class="diff-same">지난주와 동일</span>'
+        if (diff > 0 and not reverse) or (diff < 0 and reverse):
+            return f'<span class="diff-up">▲ {abs(diff)} 지난주 대비</span>'
+        return f'<span class="diff-down">▼ {abs(diff)} 지난주 대비</span>'
+
+    st.markdown(
+        f"""
+        <div class="summary-bar">
+            <div class="summary-chip">
+                <div class="summary-chip-label">📝 이번주 새로 시작한 것</div>
+                <div class="summary-chip-value">{new_this}</div>
+                <div class="summary-chip-diff">{diff_html(new_this, new_last)}</div>
+            </div>
+            <div class="summary-chip">
+                <div class="summary-chip-label">✅ 이번주 완료한 것</div>
+                <div class="summary-chip-value">{done_this}</div>
+                <div class="summary-chip-diff">{diff_html(done_this, done_last)}</div>
+            </div>
+            <div class="summary-chip">
+                <div class="summary-chip-label">💬 같이 확인이 필요한 것</div>
+                <div class="summary-chip-value">{attention_this}</div>
+                <div class="summary-chip-diff">{diff_html(attention_this, attention_last, reverse=True)}</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
 
-def alert_card_html(r: dict, days: int, style: str = "red") -> str:
-    sm = (r["summary"] or "")[:32]
-    return f"""
-<div class="alert-card {style}">
-  <div>
-    <div class="alert-key">{r['key']}</div>
-    <div class="tcard-sum">{sm}</div>
-    <div class="alert-sub">담당자 {r['assignee']} | 마지막 변경 {r['updated']}</div>
-  </div>
-  <div class="alert-days-{style}">{days}일<br>정체</div>
-</div>"""
+def render_attention(rows: list[dict]):
+    st.markdown(
+        f'<div class="section-label">💬 같이 확인이 필요한 것들 <span class="section-count">{len(rows)}건 · Drop 제외</span></div>',
+        unsafe_allow_html=True
+    )
 
-# ─── main ─────────────────────────────────────────────────────────────────
+    if not rows:
+        st.markdown('<div class="empty-msg">🎉 현재 정체된 티켓이 없어요!</div>', unsafe_allow_html=True)
+        return
 
+    for row in rows[:10]:
+        stale = days_stale(row.get("변경일_date"))
+        days_class = "days-red" if stale >= 14 else "days-orange"
+        st.markdown(
+            f"""
+            <div class="attention-item">
+                <div class="attention-days {days_class}">{stale}일</div>
+                <div style="flex:1;min-width:0;">
+                    <div class="attention-key">{h(row.get('키'))}</div>
+                    <div class="attention-summary">{h(row.get('요약'))}</div>
+                    <div class="attention-meta">
+                        <span>{h(row.get('담당자'))}</span>
+                        <span>마지막 변경 {h(row.get('변경일'))}</span>
+                        <span class="status-badge">{h(row.get('상태'))}</span>
+                    </div>
+                </div>
+                <a href="{h(row.get('링크'))}" target="_blank" style="font-size:12px;color:#2563EB;font-weight:700;white-space:nowrap;">열기 →</a>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+    if len(rows) > 10:
+        st.markdown(f'<div style="text-align:center;font-size:12px;color:#94A3B8;padding:8px;">+ {len(rows)-10}건 더 있음</div>', unsafe_allow_html=True)
+
+
+def render_new_tickets(rows: list[dict]):
+    st.markdown(
+        f'<div class="section-label">📝 이번주 새로 추가된 것들 <span class="section-count">{len(rows)}건</span></div>',
+        unsafe_allow_html=True
+    )
+
+    if not rows:
+        st.markdown('<div class="empty-msg">이번주 신규 티켓이 없어요</div>', unsafe_allow_html=True)
+        return
+
+    for row in rows:
+        st.markdown(
+            f"""
+            <div class="new-item">
+                <div class="new-dot"></div>
+                <span class="new-key">{h(row.get('키'))}</span>
+                <span class="new-summary">{h(row.get('요약'))}</span>
+                <span class="new-assignee">{h(row.get('담당자'))}</span>
+                <a href="{h(row.get('링크'))}" target="_blank" style="font-size:11px;color:#2563EB;white-space:nowrap;">열기</a>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+
+def render_weekly_flow(by_day: dict[date, list[dict]]):
+    day_names = ["월", "화", "수", "목", "금"]
+    cols_html = ""
+
+    for i, (d, items) in enumerate(sorted(by_day.items())):
+        count = len(items)
+        if count == 0:
+            inner = '<div class="day-empty">없음</div>'
+        else:
+            # 최대 3개만 미리보기
+            preview = ""
+            for r in items[:3]:
+                preview += f'<div class="day-ticket-key">{h(r.get("키"))}</div><div class="day-ticket-summary">{h(r.get("요약"))}</div>'
+            if count > 3:
+                preview += f'<div style="font-size:11px;color:#2563EB;font-weight:700;">+ {count-3}건 더</div>'
+            inner = f'<div class="day-items">{preview}</div>'
+
+        cols_html += f"""
+        <div class="day-col">
+            <div class="day-col-head">
+                <span>{day_names[i]}</span>
+                <span class="day-col-date">{d:%m/%d}</span>
+            </div>
+            <div class="day-count">{count}</div>
+            {inner}
+        </div>
+        """
+
+    st.markdown(
+        f'<div class="section-label">📅 요일별 신규 티켓</div>'
+        f'<div class="day-grid">{cols_html}</div>',
+        unsafe_allow_html=True
+    )
+
+
+# -----------------------------------------------------------------------------
+# 8. 메인
+# -----------------------------------------------------------------------------
 def main():
-    st.set_page_config(page_title="주간 업무 현황", layout="wide", page_icon="📊")
+    st.set_page_config(page_title="사업기획팀 주간 현황", layout="wide")
     inject_css()
 
-    today    = date.today()
-    mon, fri = week_bounds(today)
-    prev_mon, prev_fri = week_bounds(mon - timedelta(days=1))
+    if "selected_ticket" not in st.session_state:
+        st.session_state.selected_ticket = None
 
-    # ── 헤더 ──────────────────────────────────────────────────────────────
-    h_l, h_r = st.columns([5, 2])
-    with h_l:
-        st.markdown(
-            '<div class="hdr-title">📊 [사업기획] 주간 업무 현황'
-            '<span class="hdr-badge">Jira API 연동</span></div>',
-            unsafe_allow_html=True,
-        )
-    with h_r:
-        rc, bc = st.columns([4, 1])
-        rc.markdown(
-            f'<div class="hdr-meta">마지막 업데이트 : {datetime.now().strftime("%Y-%m-%d %H:%M")}</div>',
-            unsafe_allow_html=True,
-        )
-        if bc.button("↺", help="새로고침"):
+    if not require_config():
+        st.stop()
+
+    if st.session_state.selected_ticket:
+        render_sidebar(st.session_state.selected_ticket)
+
+    week_start, week_end = get_week_range(0)
+    last_week_start, last_week_end = get_week_range(-1)
+
+    render_header(week_start, week_end, datetime.now())
+
+    # 새로고침 버튼
+    col_refresh, col_ticket = st.columns([5, 1])
+    with col_refresh:
+        pass
+    with col_ticket:
+        if st.button("🔄 새로고침", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
 
-    # ── 필터 ──────────────────────────────────────────────────────────────
-    f1, f2, f3, _ = st.columns([2.5, 2, 1.3, 3])
-    with f1:
-        dr = st.date_input("기간", [mon, fri], label_visibility="collapsed")
-    with f2:
-        st.selectbox("팀", ["사업기획팀", "개발팀", "디자인팀", "전체"], label_visibility="collapsed")
-    with f3:
-        if st.button("필터 초기화", use_container_width=True):
-            st.rerun()
+    try:
+        with st.spinner("데이터 불러오는 중..."):
+            raw_this = fetch_issues(JIRA_SERVER, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY)
+            rows_this = [flatten(JIRA_SERVER, r) for r in raw_this]
+            this_week = build_data(rows_this, week_start, week_end)
 
-    start = dr[0] if isinstance(dr, (list, tuple)) and len(dr) > 0 else mon
-    end   = dr[1] if isinstance(dr, (list, tuple)) and len(dr) > 1 else fri
+            # 지난주 데이터 (같은 전체 데이터에서 필터)
+            last_week = build_data(rows_this, last_week_start, last_week_end)
 
-    # ── 설정 확인 ──────────────────────────────────────────────────────────
-    missing = [k for k, v in [
-        ("JIRA_SERVER", JIRA_SERVER), ("JIRA_EMAIL", JIRA_EMAIL),
-        ("JIRA_API_TOKEN", JIRA_TOKEN), ("JIRA_PROJECT_KEY", JIRA_KEY),
-    ] if not v]
-    if missing:
-        st.error(f".env 파일에 다음 정보가 없습니다: {', '.join(missing)}")
-        st.stop()
+        # 요약 바
+        render_summary_bar(this_week, last_week)
 
-    # ── 데이터 fetch ───────────────────────────────────────────────────────
-    with st.spinner("Jira 데이터 불러오는 중..."):
-        try:
-            rows = to_rows(JIRA_SERVER, fetch(JIRA_SERVER, JIRA_EMAIL, JIRA_TOKEN, JIRA_KEY))
-        except Exception as e:
-            st.error(f"데이터 가져오기 실패: {e}")
-            st.stop()
+        # 메인 레이아웃: 왼쪽(확인 필요) / 오른쪽(신규)
+        left, right = st.columns([0.55, 0.45], gap="medium")
 
-    # ── KPI 계산 ───────────────────────────────────────────────────────────
-    def in_range(r, s, e, field): return r[field] and s <= r[field] <= e
+        with left:
+            st.markdown('<div class="section-wrap">', unsafe_allow_html=True)
+            render_attention(this_week["need_attention"])
+            st.markdown('</div>', unsafe_allow_html=True)
 
-    new_this  = [r for r in rows if in_range(r, start, end, "created")]
-    chg_this  = [r for r in rows if in_range(r, start, end, "updated")
-                 and not in_range(r, start, end, "created")]
-    new_prev  = [r for r in rows if in_range(r, prev_mon, prev_fri, "created")]
-    chg_prev  = [r for r in rows if in_range(r, prev_mon, prev_fri, "updated")
-                 and not in_range(r, prev_mon, prev_fri, "created")]
+            # 티켓 상세 보기 입력
+            st.markdown('<div class="section-wrap">', unsafe_allow_html=True)
+            st.markdown('<div class="section-label">🎫 티켓 상태변경 / 댓글</div>', unsafe_allow_html=True)
+            c1, c2 = st.columns([3, 1])
+            with c1:
+                ticket_input = st.text_input("티켓 키", placeholder="예: BP-123", label_visibility="collapsed", key="ticket_input")
+            with c2:
+                if st.button("열기", use_container_width=True):
+                    if ticket_input.strip():
+                        st.session_state.selected_ticket = ticket_input.strip().upper()
+                        st.rerun()
+            st.markdown('</div>', unsafe_allow_html=True)
 
-    stag_all = sorted(
-        [r for r in rows if not r["done"] and r["updated"]
-         and (today - r["updated"]).days >= 7],
-        key=lambda x: (today - x["updated"]).days, reverse=True,
-    )
-    stag2w      = [r for r in stag_all if (today - r["updated"]).days >= 14]
-    stag1w_only = [r for r in stag_all if (today - r["updated"]).days < 14]
+        with right:
+            st.markdown('<div class="section-wrap">', unsafe_allow_html=True)
+            render_new_tickets(this_week["new_this_week"])
+            st.markdown('</div>', unsafe_allow_html=True)
 
-    # ── KPI 카드 ───────────────────────────────────────────────────────────
-    kc = st.columns(4)
-    for col, icon, label, val, delta, bad in [
-        (kc[0], "📋", "신규 발생 (이번 주)", len(new_this),  len(new_this)  - len(new_prev),  False),
-        (kc[1], "🔄", "상태 변경 (이번 주)", len(chg_this),  len(chg_this)  - len(chg_prev),  False),
-        (kc[2], "⏳", "1주 이상 정체",       len(stag_all),  0,                               True),
-        (kc[3], "⏰", "2주 이상 정체",       len(stag2w),    0,                               True),
-    ]:
-        with col:
-            render_kpi(icon, label, val, delta, bad)
+        # 요일별 흐름
+        st.markdown('<div class="section-wrap">', unsafe_allow_html=True)
+        render_weekly_flow(this_week["by_day"])
+        st.markdown('</div>', unsafe_allow_html=True)
 
-    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
-
-    # ── 주간 흐름 + 알림 ───────────────────────────────────────────────────
-    flow_col, alert_col = st.columns([7, 3])
-
-    with flow_col:
-        st.markdown('<p class="sec-title">주간 티켓 흐름 (신규 발생 &amp; 상태 변경)</p>',
-                    unsafe_allow_html=True)
-        day_cols = st.columns(5)
-        for i in range(5):
-            day     = start + timedelta(days=i)
-            day_new = [r for r in rows if r["created"] == day]
-            day_chg = [r for r in rows if r["updated"] == day and r["created"] != day]
-            with day_cols[i]:
-                html = (
-                    f'<div class="day-col">'
-                    f'<div class="day-header">{_KOR_DAYS[i]}</div>'
-                    f'<div class="day-date">{day.strftime("%m-%d")}</div>'
-                    f'<div class="day-badges">'
-                    f'<span class="badge-new">신규 {len(day_new)}</span>'
-                    f'<span class="badge-chg">변경 {len(day_chg)}</span>'
-                    f'</div>'
-                )
-                for r in day_new[:4]:
-                    html += ticket_card_html(r, "is-new")
-                for r in day_chg[:4]:
-                    html += ticket_card_html(r, "is-changed")
-                total = len(day_new) + len(day_chg)
-                if total > 8:
-                    html += f'<div class="more-link">+ {total - 8}건 더 보기</div>'
-                html += "</div>"
-                st.markdown(html, unsafe_allow_html=True)
-
-    with alert_col:
-        st.markdown('<p class="sec-title">검토 지연 알림</p>', unsafe_allow_html=True)
-        html_a = '<div class="alert-panel">'
-        if stag2w:
-            html_a += (
-                f'<div class="alert-group-title" style="color:#c62828">'
-                f'2주 이상 정체 ({len(stag2w)})</div>'
-            )
-            for r in stag2w[:3]:
-                html_a += alert_card_html(r, (today - r["updated"]).days, "red")
-        if stag1w_only:
-            html_a += (
-                f'<div class="alert-group-title" style="color:#e65100">'
-                f'1주 이상 정체 ({len(stag1w_only)})</div>'
-            )
-            for r in stag1w_only[:5]:
-                html_a += alert_card_html(r, (today - r["updated"]).days, "orange")
-        if not stag2w and not stag1w_only:
-            html_a += '<div style="color:#888;font-size:.82rem;padding:12px 0">정체 티켓이 없습니다 ✓</div>'
-        rest = len(stag_all) - 8
-        if rest > 0:
-            html_a += f'<div class="more-link" style="text-align:right;margin-top:6px">+ {rest}건 더 보기 ›</div>'
-        html_a += "</div>"
-        st.markdown(html_a, unsafe_allow_html=True)
-
-    # ── 전체 티켓 리스트 ───────────────────────────────────────────────────
-    st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
-    st.markdown('<p class="sec-title">전체 티켓 리스트</p>', unsafe_allow_html=True)
-
-    df = pd.DataFrame([{
-        "키":           r["key"],
-        "요약":         r["summary"],
-        "상태":         r["status"],
-        "담당자":       r["assignee"],
-        "생성일":       str(r["created"])  if r["created"]  else "—",
-        "마지막 변경일": str(r["updated"]) if r["updated"]  else "—",
-        "링크":         r["link"],
-    } for r in rows])
-
-    st.dataframe(
-        df,
-        use_container_width=True,
-        hide_index=True,
-        column_config={"링크": st.column_config.LinkColumn("링크", display_text="열기")},
-    )
+    except requests.HTTPError as e:
+        st.error(f"Jira API 오류: {e}")
+    except Exception as e:
+        st.error(f"오류가 발생했습니다: {e}")
 
 
 if __name__ == "__main__":
