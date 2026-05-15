@@ -243,7 +243,7 @@ def inject_css():
     @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700;800&display=swap');
     html, body, [class*="css"] { font-family: 'Noto Sans KR', system-ui, sans-serif; }
     .stApp { background: #F0F4F8; }
-    .block-container { padding-top: 1.2rem; padding-bottom: 3rem; max-width: 1600px; }
+    .block-container { padding-top: 3.5rem; padding-bottom: 3rem; max-width: 1600px; }
 
     .dash-header {
         background: white; border-radius: 16px; padding: 18px 24px; margin-bottom: 16px;
