@@ -519,19 +519,35 @@ def render_create_ticket():
 # 렌더링
 # -----------------------------------------------------------------------------
 def render_header(ws, we):
-    st.markdown(
-        f"""<div class="dash-header">
-            <div>
-                <div class="dash-title">🗂 사업기획팀 주간 현황</div>
-                <div class="dash-sub">Jira를 열지 않아도 모든 업무를 처리할 수 있어요</div>
+    col_logo, col_title, col_date = st.columns([0.06, 0.7, 0.24])
+    with col_logo:
+        st.image("assets/logo.jpeg", width=48)
+    with col_title:
+        st.markdown(
+            f"""<div style="display:flex;align-items:center;height:56px;gap:12px;">
+                <h1 style="font-size:22px;font-weight:800;color:#0F172A;letter-spacing:-0.03em;margin:0;">
+                    사업기획팀 주간 현황
+                </h1>
+                <span style="font-size:12px;color:#0057FF;background:#EEF4FF;border:1px solid #BFDBFE;
+                    border-radius:999px;padding:4px 10px;font-weight:700;">
+                    Jira 연동
+                </span>
             </div>
-            <div class="dash-week">
-                {ws:%Y.%m.%d}(월) ~ {we:%Y.%m.%d}(금)<br>
-                <span style="font-size:11px;">업데이트 {fmt_dt(datetime.now())}</span>
-            </div>
-        </div>""",
-        unsafe_allow_html=True
-    )
+            <div style="font-size:13px;color:#64748B;">
+                Jira를 열지 않아도 모든 업무를 처리할 수 있어요
+            </div>""",
+            unsafe_allow_html=True
+        )
+    with col_date:
+        st.markdown(
+            f"""<div style="height:56px;display:flex;align-items:center;justify-content:flex-end;">
+                <div style="text-align:right;font-size:13px;color:#94A3B8;">
+                    {ws:%Y.%m.%d}(월) ~ {we:%Y.%m.%d}(금)<br>
+                    <span style="font-size:11px;">업데이트 {fmt_dt(datetime.now())}</span>
+                </div>
+            </div>""",
+            unsafe_allow_html=True
+        )
 
 
 def render_summary(this, last):
