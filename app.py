@@ -722,32 +722,34 @@ def main():
     if st.session_state.selected_ticket:
         render_sidebar(st.session_state.selected_ticket)
 
+    # 주차 선택
+    week_options = {
+        "이번주": 0,
+        "지난주": -1,
+        "2주 전": -2,
+        "3주 전": -3,
+    }
 
+    render_header_temp = st.empty()
 
-    render_header(ws, we)
-# 주차 선택 드롭다운
-week_options = {
-    "이번주": 0,
-    "지난주": -1,
-    "2주 전": -2,
-    "3주 전": -3,
-}
-selected_week = st.selectbox("📅 조회 주차 선택", list(week_options.keys()), index=0, key="week_select")
-offset = week_options[selected_week]
-ws, we = week_range(offset)
-lws, lwe = week_range(offset - 1)
-    # 상단 버튼
-    b1, b2, b3 = st.columns([4, 1, 1])
-    with b2:
+    col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
+    with col1:
+        selected_week = st.selectbox("📅 조회 주차", list(week_options.keys()), index=0, key="week_select")
+    with col3:
         if st.button("➕ 새 티켓", use_container_width=True):
             st.session_state.create_open = not st.session_state.get("create_open", False)
             st.rerun()
-    with b3:
+    with col4:
         if st.button("🔄 새로고침", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
 
-    # 새 티켓 생성
+    offset = week_options[selected_week]
+    ws, we = week_range(offset)
+    lws, lwe = week_range(offset - 1)
+
+    render_header(ws, we)
+
     if st.session_state.get("create_open", False):
         render_create_ticket()
 
