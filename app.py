@@ -722,11 +722,20 @@ def main():
     if st.session_state.selected_ticket:
         render_sidebar(st.session_state.selected_ticket)
 
-    ws, we = week_range(0)
-    lws, lwe = week_range(-1)
+
 
     render_header(ws, we)
-
+# 주차 선택 드롭다운
+week_options = {
+    "이번주": 0,
+    "지난주": -1,
+    "2주 전": -2,
+    "3주 전": -3,
+}
+selected_week = st.selectbox("📅 조회 주차 선택", list(week_options.keys()), index=0, key="week_select")
+offset = week_options[selected_week]
+ws, we = week_range(offset)
+lws, lwe = week_range(offset - 1)
     # 상단 버튼
     b1, b2, b3 = st.columns([4, 1, 1])
     with b2:
