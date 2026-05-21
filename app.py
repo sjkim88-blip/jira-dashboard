@@ -644,7 +644,7 @@ def render_left(data):
     st.markdown('<div class="card-title">🔍 티켓 검색 & 수정</div>', unsafe_allow_html=True)
     c1, c2 = st.columns([3, 1])
     with c1:
-        ticket_input = st.text_input("", placeholder="예: BP-123", key="ticket_input", label_visibility="collapsed")
+        ticket_input = st.text_input("티켓 키", placeholder="예: BP-123", key="ticket_input", label_visibility="collapsed")
     with c2:
         if st.button("열기", use_container_width=True):
             if ticket_input.strip():
